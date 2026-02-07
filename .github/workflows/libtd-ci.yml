@@ -1,0 +1,152 @@
+name: libtd-ci
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+    - cron: '0 15 * * *'
+  workflow_dispatch:
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checking new tdlib/td version
+      id: check_version
+      run: |
+        LATEST_COMMIT=$(curl -s https://api.github.com/repos/tdlib/td/commits/master | jq -r '.commit.message' | head -n 1)
+        echo "Latest commit message: $LATEST_COMMIT"
+        
+        if [[ "$LATEST_COMMIT" =~ ^Update\ version\ to\ [0-9]+\.[0-9]+\.[0-9]+\.$ ]]; then
+          echo "Version update detected: $LATEST_COMMIT"
+          VERSION=$(echo "$LATEST_COMMIT" | grep -oP '(?<=Update version to )[0-9]+\.[0-9]+\.[0-9]+')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "should_build=true" >> $GITHUB_OUTPUT
+        else
+          echo "No version update in latest commit"
+          echo "should_build=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Checking out libtd repo
+      if: steps.check_version.outputs.should_build == 'true'
+      uses: actions/checkout@v6
+      with:
+        repository: Miogram/libtd
+        token: ${{ secrets.PAT_TOKEN }}
+
+    - name: Checking if version already built
+      if: steps.check_version.outputs.should_build == 'true'
+      id: check_existing
+      run: |
+        VERSION="${{ steps.check_version.outputs.version }}"
+        if git tag | grep -q "^v$VERSION$"; then
+          echo "Version $VERSION already built"
+          echo "skip_build=true" >> $GITHUB_OUTPUT
+        else
+          echo "Version $VERSION not found, proceeding with build"
+          echo "skip_build=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Cloning tdlib/td repo
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      run: |
+        git clone --depth=1 https://github.com/tdlib/td.git td
+
+    - name: Setting up JDK 17
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      uses: actions/setup-java@v5
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Caching Android SDK
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      uses: actions/cache@v5
+      with:
+        path: td/example/android/android-sdk
+        key: android-sdk-${{ runner.os }}
+
+    - name: Caching OpenSSL
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      uses: actions/cache@v5
+      with:
+        path: td/example/android/third_party/openssl
+        key: openssl-${{ runner.os }}-${{ hashFiles('td/example/android/build-openssl.sh') }}
+
+    - name: Caching NDK
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      uses: actions/cache@v5
+      with:
+        path: td/example/android/android-ndk
+        key: android-ndk-${{ runner.os }}
+
+    - name: Installing deps
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gperf make perl php sed tar unzip
+
+    - name: Run environment checking
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      run: |
+        cd td/example/android
+        ./check-environment.sh
+
+    - name: Fetching Android SDK
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      run: |
+        cd td/example/android
+        ./fetch-sdk.sh
+
+    - name: Building OpenSSL
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      run: |
+        cd td/example/android
+        ./build-openssl.sh
+
+    - name: Building tdlib
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      run: |
+        cd td/example/android
+        ./build-tdlib.sh
+
+    - name: Preparing directory structure
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      run: |
+        mkdir -p src/main/java
+        mkdir -p src/main/libs
+        cp -r td/example/android/tdlib/java/* src/main/java/
+        cp -r td/example/android/tdlib/libs/* src/main/libs/
+        rm -rf td
+
+    - name: Configuring Git
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Committing and pushing changes
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      run: |
+        VERSION="${{ steps.check_version.outputs.version }}"
+        git add src/
+        git commit -m "Update TDLib to version $VERSION" || echo "No changes to commit"
+        git tag "v$VERSION"
+        git push origin master
+        git push origin "v$VERSION"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+    - name: Creating release
+      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ steps.check_version.outputs.version }}
+        name: libtd v${{ steps.check_version.outputs.version }}
+        body: |
+          Automated libtd ${{ steps.check_version.outputs.version }} build
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+
