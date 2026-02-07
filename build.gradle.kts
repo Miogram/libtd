@@ -6,24 +6,10 @@ android {
     namespace = "org.drinkless.tdlib"
     compileSdk = 36
 
-    defaultConfig {
-        minSdk = 27
-    }
-
-    buildTypes {
-        release {
-            isMinifyEnabled = false
-        }
-    }
-
     sourceSets {
         getByName("main") {
-            jniLibs.directories.setFrom("src/main/libs")
+            jniLibs.directories.add("src/main/libs")
         }
-    }
-
-    lint {
-        disable += "InvalidPackage"
     }
 }
 
