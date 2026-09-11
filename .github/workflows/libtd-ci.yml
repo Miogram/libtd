@@ -4,6 +4,14 @@ on:
   schedule:
     - cron: '17 3,15 * * *'
   workflow_dispatch:
+    inputs:
+      build_target:
+        description: 'TDLib build target'
+        type: choice
+        default: latest-release
+        options:
+          - latest-release
+          - latest-commit
 
 permissions:
   contents: read
@@ -20,6 +28,7 @@ env:
   ANDROID_ABIS: arm64-v8a armeabi-v7a
   ANDROID_PLATFORM: android-27
   ABI_CACHE_KEY: arm64-v8a-armeabi-v7a
+  BUILD_TARGET: ${{ inputs.build_target || 'latest-release' }}
 
 jobs:
   build:
@@ -29,6 +38,7 @@ jobs:
       version: ${{ steps.upstream.outputs.version }}
       sha: ${{ steps.upstream.outputs.sha }}
       should_build: ${{ steps.upstream.outputs.should_build }}
+      prerelease: ${{ steps.upstream.outputs.prerelease }}
 
     steps:
       - name: Check out publisher
@@ -37,37 +47,59 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Resolve latest TDLib release commit
+      - name: Resolve TDLib build target
         id: upstream
         shell: bash
         run: |
           set -euo pipefail
 
-          git clone --filter=blob:none --no-checkout --single-branch \
-            --branch master https://github.com/tdlib/td.git td
-
-          record=$(git -C td log origin/master -1 --extended-regexp \
-            --grep='^Update version to [0-9]+\.[0-9]+\.[0-9]+\.?$' \
-            --format='%H%x09%s')
-          if [[ -z "$record" ]]; then
-            echo 'Unable to find the latest TDLib version commit.' >&2
+          if [[ "$BUILD_TARGET" != 'latest-release' && "$BUILD_TARGET" != 'latest-commit' ]]; then
+            echo "Unknown build target: $BUILD_TARGET" >&2
             exit 1
           fi
 
-          IFS=$'\t' read -r sha subject <<< "$record"
-          version=${subject#Update version to }
-          version=${version%.}
+          git clone --filter=blob:none --no-checkout --single-branch \
+            --branch master https://github.com/tdlib/td.git td
 
-          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$BUILD_TARGET" == 'latest-commit' ]]; then
+            sha=$(git -C td log origin/master -1 --format='%H')
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
 
-          git -C td checkout --detach "$sha"
-          declared=$(sed -nE \
-            's/^project\(TDLib VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' \
-            td/CMakeLists.txt)
-          if [[ "$declared" != "$version" ]]; then
-            echo "TDLib version mismatch: commit says $version, CMake says $declared" >&2
-            exit 1
+            git -C td checkout --detach "$sha"
+            declared=$(sed -nE \
+              's/^project\(TDLib VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' \
+              td/CMakeLists.txt)
+            [[ "$declared" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+            version="$declared-${sha:0:12}"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{12}$ ]]
+            echo "Building latest TDLib master commit $sha as $version."
+            echo 'prerelease=true' >> "$GITHUB_OUTPUT"
+          else
+            record=$(git -C td log origin/master -1 --extended-regexp \
+              --grep='^Update version to [0-9]+\.[0-9]+\.[0-9]+\.?$' \
+              --format='%H%x09%s')
+            if [[ -z "$record" ]]; then
+              echo 'Unable to find the latest TDLib version commit.' >&2
+              exit 1
+            fi
+
+            IFS=$'\t' read -r sha subject <<< "$record"
+            version=${subject#Update version to }
+            version=${version%.}
+
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+            git -C td checkout --detach "$sha"
+            declared=$(sed -nE \
+              's/^project\(TDLib VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' \
+              td/CMakeLists.txt)
+            if [[ "$declared" != "$version" ]]; then
+              echo "TDLib version mismatch: commit says $version, CMake says $declared" >&2
+              exit 1
+            fi
+            echo 'prerelease=false' >> "$GITHUB_OUTPUT"
           fi
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -328,6 +360,7 @@ jobs:
           TARGET_BRANCH: ${{ github.event.repository.default_branch }}
           VERSION: ${{ needs.build.outputs.version }}
           UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
         shell: bash
         run: |
           set -euo pipefail
@@ -336,28 +369,40 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A -- src/main/java src/main/libs
           git diff --cached --check
-          if git diff --cached --quiet; then
-            echo 'A new TDLib version produced no generated changes.' >&2
+          git fetch origin "$TARGET_BRANCH" --tags
+
+          upstream_url="https://github.com/tdlib/td/commit/$UPSTREAM_SHA"
+          if git show-ref --verify --quiet "refs/tags/v$VERSION"; then
+            echo "Tag v$VERSION already exists." >&2
             exit 1
           fi
 
-          git commit \
-            -m "chore(libtd): update TDLib to $VERSION" \
-            -m "Upstream: https://github.com/tdlib/td/commit/$UPSTREAM_SHA"
+          if git diff --cached --quiet; then
+            echo 'Build produced no generated changes; publishing the tag only.'
+            git tag -a "v$VERSION" -m "libtd v$VERSION" -m "Upstream: $upstream_url"
+            gh auth setup-git
+            git push --atomic origin "refs/tags/v$VERSION:refs/tags/v$VERSION"
+            exit 0
+          fi
 
-          git fetch origin "$TARGET_BRANCH" --tags
+          if [[ "$PRERELEASE" == 'true' ]]; then
+            git commit \
+              -m "chore(libtd): snapshot TDLib $VERSION" \
+              -m "Upstream: $upstream_url"
+          else
+            git commit \
+              -m "chore(libtd): update TDLib to $VERSION" \
+              -m "Upstream: $upstream_url"
+          fi
+
           base=$(git rev-parse HEAD^)
           remote=$(git rev-parse "origin/$TARGET_BRANCH")
           if [[ "$base" != "$remote" ]]; then
             echo 'The publisher branch moved during the build; rerun the workflow.' >&2
             exit 1
           fi
-          if git show-ref --verify --quiet "refs/tags/v$VERSION"; then
-            echo "Tag v$VERSION already exists." >&2
-            exit 1
-          fi
 
-          git tag -a "v$VERSION" -m "libtd v$VERSION"
+          git tag -a "v$VERSION" -m "libtd v$VERSION" -m "Upstream: $upstream_url"
           gh auth setup-git
           git push --atomic origin \
             "HEAD:refs/heads/$TARGET_BRANCH" \
@@ -387,6 +432,7 @@ jobs:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.build.outputs.version }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
         shell: bash
         run: |
           set -euo pipefail
@@ -403,7 +449,8 @@ jobs:
             printf 'Automated libtd %s build.\n' "$VERSION" > "$notes_file"
           fi
 
-          gh release create "$tag" \
-            --verify-tag \
-            --title "libtd v$VERSION" \
-            --notes-file "$notes_file"
+          args=(--verify-tag --title "libtd v$VERSION" --notes-file "$notes_file")
+          if [[ "$PRERELEASE" == 'true' ]]; then
+            args+=(--prerelease --latest=false)
+          fi
+          gh release create "$tag" "${args[@]}"
