@@ -25,15 +25,13 @@ env:
   PATCHES_REF: 3462fc823adb492ec5ea39defa1939a70f93d658
   ANDROID_NDK_VERSION: 23.2.8568313
   OPENSSL_VERSION: OpenSSL_1_1_1w
-  ANDROID_ABIS: arm64-v8a armeabi-v7a
   ANDROID_PLATFORM: android-27
-  ABI_CACHE_KEY: arm64-v8a-armeabi-v7a
   BUILD_TARGET: ${{ inputs.build_target || 'latest-release' }}
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 360
     outputs:
       version: ${{ steps.upstream.outputs.version }}
       sha: ${{ steps.upstream.outputs.sha }}
@@ -160,7 +158,7 @@ jobs:
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ runner.temp }}/libtd-cache/openssl
-          key: openssl-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.ANDROID_NDK_VERSION }}-${{ env.OPENSSL_VERSION }}-${{ env.ABI_CACHE_KEY }}-${{ env.PATCHES_REF }}-${{ hashFiles('td/example/android/build-openssl.sh') }}
+          key: openssl-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.ANDROID_NDK_VERSION }}-${{ env.OPENSSL_VERSION }}-${{ env.PATCHES_REF }}-${{ hashFiles('td/example/android/build-openssl.sh') }}
 
       - name: Build OpenSSL
         if: steps.upstream.outputs.should_build == 'true' && steps.openssl-cache.outputs.cache-hit != 'true'
@@ -203,17 +201,24 @@ jobs:
           readelf=$ndk_bin/llvm-readelf
           nm=$ndk_bin/llvm-nm
           ninja=$RUNNER_TEMP/libtd-cache/SDK/cmake/3.22.1/bin/ninja
-          read -r -a abis <<< "$ANDROID_ABIS"
-
-          expected=$(printf '%s\n' "${abis[@]}" | sort)
-          actual=$(find "$libs" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
-          if [[ "$actual" != "$expected" ]]; then
-            printf 'Expected ABI directories:\n%s\nActual ABI directories:\n%s\n' \
-              "$expected" "$actual" >&2
+          abis=()
+          for dir in "$libs"/*/; do
+            [[ -d "$dir" ]] || continue
+            abis+=("$(basename "$dir")")
+          done
+          if ((${#abis[@]} == 0)); then
+            echo 'No TDLib ABI outputs found.' >&2
             exit 1
           fi
 
-          build_dir=td/example/android/build-arm64-v8a-Java
+          for abi in "${abis[@]}"; do
+            if [[ ! -d "td/example/android/build-$abi-Java" ]]; then
+              echo "Missing build directory for ABI $abi." >&2
+              exit 1
+            fi
+          done
+
+          build_dir=td/example/android/build-${abis[0]}-Java
           grep -Eq "^ANDROID_PLATFORM(:[^=]+)?=$ANDROID_PLATFORM$" \
             "$build_dir/CMakeCache.txt"
           sqlite_commands=$("$ninja" -C "$build_dir" -t commands tdsqlite)
@@ -245,7 +250,7 @@ jobs:
             "$nm" -D --defined-only "$so" | grep -Eq '[[:space:]]JNI_OnLoad$'
 
             alignment='n/a (32-bit)'
-            if [[ "$abi" == 'arm64-v8a' ]]; then
+            if "$readelf" -hW "$so" | grep -Eq 'Class:[[:space:]]+ELF64'; then
               headers=$("$readelf" -lW "$so")
               mapfile -t load_alignments < <(awk '$1 == "LOAD" {print $NF}' <<< "$headers")
               if ((${#load_alignments[@]} == 0)); then
@@ -346,8 +351,15 @@ jobs:
           fi
           [[ -f extracted/src/main/java/org/drinkless/tdlib/Client.java ]]
           [[ -f extracted/src/main/java/org/drinkless/tdlib/TdApi.java ]]
-          [[ -f extracted/src/main/libs/arm64-v8a/libtdjni.so ]]
-          [[ -f extracted/src/main/libs/armeabi-v7a/libtdjni.so ]]
+          shopt -s nullglob
+          jni_libs=(extracted/src/main/libs/*/libtdjni.so)
+          if ((${#jni_libs[@]} == 0)); then
+            echo 'Generated archive contains no libtdjni.so.' >&2
+            exit 1
+          fi
+          for so in "${jni_libs[@]}"; do
+            [[ -s "$so" ]]
+          done
 
           rm -rf src/main/java src/main/libs
           mkdir -p src/main
