@@ -2,163 +2,408 @@ name: libtd-ci
 
 on:
   schedule:
-    - cron: '0 3 * * *'
-    - cron: '0 15 * * *'
+    - cron: '17 3,15 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: libtd-publisher-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  PATCHES_REPOSITORY: Miogram/patches
+  PATCHES_REF: 3462fc823adb492ec5ea39defa1939a70f93d658
+  ANDROID_NDK_VERSION: 23.2.8568313
+  OPENSSL_VERSION: OpenSSL_1_1_1w
+  ANDROID_ABIS: arm64-v8a armeabi-v7a
+  ANDROID_PLATFORM: android-27
+  ABI_CACHE_KEY: arm64-v8a-armeabi-v7a
+
 jobs:
-  check-and-build:
-    runs-on: ubuntu-latest
-    
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    outputs:
+      version: ${{ steps.upstream.outputs.version }}
+      sha: ${{ steps.upstream.outputs.sha }}
+      should_build: ${{ steps.upstream.outputs.should_build }}
+
     steps:
-    - name: Checking new tdlib/td version
-      id: check_version
-      run: |
-        COMMITS=$(curl -s "https://api.github.com/repos/tdlib/td/commits?per_page=10")
-        VERSION_COMMIT=$(echo "$COMMITS" | jq -r '.[] | select(.commit.message | startswith("Update version to ")) | .commit.message' | head -n 1)
-        if [ -z "$VERSION_COMMIT" ]; then
-          echo "No version update found in last 10 commits"
-          echo "should_build=false" >> $GITHUB_OUTPUT
-          exit 0
-        fi
-        echo "Found version commit: $VERSION_COMMIT"
-        VERSION=$(echo "$VERSION_COMMIT" | grep -oP '(?<=Update version to )[0-9]+\.[0-9]+\.[0-9]+')
-        COMMIT_SHA=$(echo "$COMMITS" | jq -r '.[] | select(.commit.message | startswith("Update version to ")) | .sha' | head -n 1)
-        COMMIT_DATE=$(echo "$COMMITS" | jq -r '.[] | select(.commit.message | startswith("Update version to ")) | .commit.author.date' | head -n 1)
-        COMMIT_TIMESTAMP=$(date -d "$COMMIT_DATE" +%s)
-        CURRENT_TIMESTAMP=$(date +%s)
-        HOURS_AGO=$(( ($CURRENT_TIMESTAMP - $COMMIT_TIMESTAMP) / 3600 ))
-        if [ $HOURS_AGO -gt 24 ]; then
-          echo "Version commit is older than 24 hours, skipping"
-          echo "should_build=false" >> $GITHUB_OUTPUT
-          exit 0
-        fi
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
-        echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
-        echo "should_build=true" >> $GITHUB_OUTPUT
+      - name: Check out publisher
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-    - name: Checking out libtd repo
-      if: steps.check_version.outputs.should_build == 'true'
-      uses: actions/checkout@v6
-      with:
-        repository: Miogram/libtd
-        token: ${{ secrets.PAT_TOKEN }}
+      - name: Resolve latest TDLib release commit
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
 
-    - name: Checking if version already built
-      if: steps.check_version.outputs.should_build == 'true'
-      id: check_existing
-      run: |
-        VERSION="${{ steps.check_version.outputs.version }}"
-        if git tag | grep -q "^v$VERSION$"; then
-          echo "Version $VERSION already built"
-          echo "skip_build=true" >> $GITHUB_OUTPUT
-        else
-          echo "Version $VERSION not found, proceeding with build"
-          echo "skip_build=false" >> $GITHUB_OUTPUT
-        fi
+          git clone --filter=blob:none --no-checkout --single-branch \
+            --branch master https://github.com/tdlib/td.git td
 
-    - name: Cloning tdlib/td repo
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      run: |
-        git clone https://github.com/tdlib/td.git td
-        cd td
-        git checkout ${{ steps.check_version.outputs.commit_sha }}
+          record=$(git -C td log origin/master -1 --extended-regexp \
+            --grep='^Update version to [0-9]+\.[0-9]+\.[0-9]+\.?$' \
+            --format='%H%x09%s')
+          if [[ -z "$record" ]]; then
+            echo 'Unable to find the latest TDLib version commit.' >&2
+            exit 1
+          fi
 
-    - name: Setting up JDK 17
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      uses: actions/setup-java@v5
-      with:
-        distribution: 'temurin'
-        java-version: '17'
+          IFS=$'\t' read -r sha subject <<< "$record"
+          version=${subject#Update version to }
+          version=${version%.}
 
-    - name: Caching Android SDK
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      uses: actions/cache@v5
-      with:
-        path: td/example/android/android-sdk
-        key: android-sdk-${{ runner.os }}
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 
-    - name: Caching OpenSSL
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      uses: actions/cache@v5
-      with:
-        path: td/example/android/third_party/openssl
-        key: openssl-${{ runner.os }}-${{ hashFiles('td/example/android/build-openssl.sh') }}
+          git -C td checkout --detach "$sha"
+          declared=$(sed -nE \
+            's/^project\(TDLib VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' \
+            td/CMakeLists.txt)
+          if [[ "$declared" != "$version" ]]; then
+            echo "TDLib version mismatch: commit says $version, CMake says $declared" >&2
+            exit 1
+          fi
 
-    - name: Caching NDK
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      uses: actions/cache@v5
-      with:
-        path: td/example/android/android-ndk
-        key: android-ndk-${{ runner.os }}
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if git show-ref --verify --quiet "refs/tags/v$version"; then
+            echo "TDLib $version is already published."
+            echo 'should_build=false' >> "$GITHUB_OUTPUT"
+          else
+            echo "TDLib $version needs to be built."
+            echo 'should_build=true' >> "$GITHUB_OUTPUT"
+          fi
 
-    - name: Installing deps
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y gperf make perl php sed tar unzip
+      - name: Validate and apply downstream patches
+        if: steps.upstream.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout \
+            "https://github.com/$PATCHES_REPOSITORY.git" downstream-patches
+          git -C downstream-patches checkout --detach "$PATCHES_REF"
+          ./downstream-patches/tdlib/apply.sh td
 
-    - name: Run environment checking
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      run: |
-        cd td/example/android
-        ./check-environment.sh
+      - name: Set up JDK 17
+        if: steps.upstream.outputs.should_build == 'true'
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
 
-    - name: Fetching Android SDK
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      run: |
-        cd td/example/android
-        ./fetch-sdk.sh
+      - name: Install build tools
+        if: steps.upstream.outputs.should_build == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential gperf make ninja-build perl php-cli sed tar unzip
 
-    - name: Building OpenSSL
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      run: |
-        cd td/example/android
-        ./build-openssl.sh
+      - name: Cache Android SDK and NDK
+        if: steps.upstream.outputs.should_build == 'true'
+        id: sdk-cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/libtd-cache/SDK
+          key: android-sdk-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.ANDROID_NDK_VERSION }}-${{ hashFiles('td/example/android/fetch-sdk.sh') }}
 
-    - name: Building tdlib
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      run: |
-        cd td/example/android
-        ./build-tdlib.sh
+      - name: Fetch Android SDK and NDK
+        if: steps.upstream.outputs.should_build == 'true' && steps.sdk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk=$RUNNER_TEMP/libtd-cache/SDK
+          rm -rf "$sdk"
+          cd td/example/android
+          ./fetch-sdk.sh "$sdk" "$ANDROID_NDK_VERSION"
 
-    - name: Preparing directory structure
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      run: |
-        mkdir -p src/main/java
-        mkdir -p src/main/libs
-        cp -r td/example/android/tdlib/java/* src/main/java/
-        cp -r td/example/android/tdlib/libs/* src/main/libs/
-        rm -rf td
+      - name: Cache OpenSSL
+        if: steps.upstream.outputs.should_build == 'true'
+        id: openssl-cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/libtd-cache/openssl
+          key: openssl-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.ANDROID_NDK_VERSION }}-${{ env.OPENSSL_VERSION }}-${{ env.ABI_CACHE_KEY }}-${{ env.PATCHES_REF }}-${{ hashFiles('td/example/android/build-openssl.sh') }}
 
-    - name: Configuring Git
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Build OpenSSL
+        if: steps.upstream.outputs.should_build == 'true' && steps.openssl-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl=$RUNNER_TEMP/libtd-cache/openssl
+          rm -rf "$openssl"
+          cd td/example/android
+          ./build-openssl.sh \
+            "$RUNNER_TEMP/libtd-cache/SDK" \
+            "$ANDROID_NDK_VERSION" \
+            "$openssl" \
+            "$OPENSSL_VERSION"
 
-    - name: Committing and pushing changes
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      run: |
-        VERSION="${{ steps.check_version.outputs.version }}"
-        git add src/
-        git commit -m "Update TDLib to version $VERSION" || echo "No changes to commit"
-        git tag "v$VERSION"
-        git push origin master
-        git push origin "v$VERSION"
-      env:
-        GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+      - name: Build TDLib
+        if: steps.upstream.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd td/example/android
+          ./build-tdlib.sh \
+            "$RUNNER_TEMP/libtd-cache/SDK" \
+            "$ANDROID_NDK_VERSION" \
+            "$RUNNER_TEMP/libtd-cache/openssl" \
+            c++_static \
+            Java
 
-    - name: Creating release
-      if: steps.check_version.outputs.should_build == 'true' && steps.check_existing.outputs.skip_build == 'false'
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: v${{ steps.check_version.outputs.version }}
-        name: libtd v${{ steps.check_version.outputs.version }}
-        body: |
-          Automated libtd ${{ steps.check_version.outputs.version }} build
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+      - name: Verify ELF files and report sizes
+        if: steps.upstream.outputs.should_build == 'true'
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
+          libs=td/example/android/tdlib/libs
+          ndk_bin=$RUNNER_TEMP/libtd-cache/SDK/ndk/$ANDROID_NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin
+          readelf=$ndk_bin/llvm-readelf
+          nm=$ndk_bin/llvm-nm
+          ninja=$RUNNER_TEMP/libtd-cache/SDK/cmake/3.22.1/bin/ninja
+          read -r -a abis <<< "$ANDROID_ABIS"
+
+          expected=$(printf '%s\n' "${abis[@]}" | sort)
+          actual=$(find "$libs" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+          if [[ "$actual" != "$expected" ]]; then
+            printf 'Expected ABI directories:\n%s\nActual ABI directories:\n%s\n' \
+              "$expected" "$actual" >&2
+            exit 1
+          fi
+
+          build_dir=td/example/android/build-arm64-v8a-Java
+          grep -Eq "^ANDROID_PLATFORM(:[^=]+)?=$ANDROID_PLATFORM$" \
+            "$build_dir/CMakeCache.txt"
+          sqlite_commands=$("$ninja" -C "$build_dir" -t commands tdsqlite)
+          grep -F 'sqlite3.c' <<< "$sqlite_commands" \
+            | grep -F -- '-flto=thin' \
+            | grep -Fq -- '-Oz'
+
+          {
+            echo "## libtd $VERSION"
+            echo
+            echo "Upstream: https://github.com/tdlib/td/commit/$UPSTREAM_SHA"
+            echo
+            echo '| ABI | Bytes | MiB | Previous bytes | Delta bytes | Relocations | LOAD alignment |'
+            echo '|---|---:|---:|---:|---:|---|---|'
+          } > size-report.md
+
+          for abi in "${abis[@]}"; do
+            so=$libs/$abi/libtdjni.so
+            [[ -s "$so" ]]
+
+            dynamic=$("$readelf" -dW "$so")
+            sections=$("$readelf" -SW "$so")
+            grep -Eq '\(ANDROID_RELA?\)' <<< "$dynamic"
+            grep -Eq '[[:space:]]ANDROID_RELA?[[:space:]]' <<< "$sections"
+            if grep -Fq '.symtab' <<< "$sections"; then
+              echo "$so still contains a static symbol table." >&2
+              exit 1
+            fi
+            "$nm" -D --defined-only "$so" | grep -Eq '[[:space:]]JNI_OnLoad$'
+
+            alignment='n/a (32-bit)'
+            if [[ "$abi" == 'arm64-v8a' ]]; then
+              headers=$("$readelf" -lW "$so")
+              mapfile -t load_alignments < <(awk '$1 == "LOAD" {print $NF}' <<< "$headers")
+              if ((${#load_alignments[@]} == 0)); then
+                echo "$so has no LOAD segments." >&2
+                exit 1
+              fi
+              for value in "${load_alignments[@]}"; do
+                [[ "$value" =~ ^0x[0-9a-fA-F]+$ ]]
+                if ((value < 0x4000)); then
+                  echo "$so has a LOAD segment below 16 KiB alignment: $value" >&2
+                  exit 1
+                fi
+              done
+              alignment=$(IFS=,; echo "${load_alignments[*]}")
+            fi
+
+            bytes=$(stat -c '%s' "$so")
+            mib=$(awk -v bytes="$bytes" 'BEGIN {printf "%.2f", bytes / 1048576}')
+            previous=src/main/libs/$abi/libtdjni.so
+            previous_bytes=0
+            if [[ -f "$previous" ]]; then
+              previous_bytes=$(stat -c '%s' "$previous")
+            fi
+            delta=$((bytes - previous_bytes))
+
+            printf '| `%s` | %s | %s | %s | %+d | APS2 | `%s` |\n' \
+              "$abi" "$bytes" "$mib" "$previous_bytes" "$delta" "$alignment" \
+              >> size-report.md
+          done
+
+          cat size-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package generated outputs
+        if: steps.upstream.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf generated libtd-generated.tar.gz
+          mkdir -p generated/src/main
+          cp -a td/example/android/tdlib/java generated/src/main/java
+          cp -a td/example/android/tdlib/libs generated/src/main/libs
+          if find generated -type l -print -quit | grep -q .; then
+            echo 'Generated output contains a symbolic link.' >&2
+            exit 1
+          fi
+          tar -C generated -czf libtd-generated.tar.gz src
+
+      - name: Upload generated outputs
+        if: steps.upstream.outputs.should_build == 'true'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: libtd-${{ steps.upstream.outputs.version }}
+          path: |
+            libtd-generated.tar.gz
+            size-report.md
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: needs.build.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out publisher
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download generated outputs
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: libtd-${{ needs.build.outputs.version }}
+          path: artifact
+
+      - name: Replace generated sources and libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=artifact/libtd-generated.tar.gz
+          [[ -s "$archive" ]]
+          listing=$(tar -tzf "$archive")
+          if grep -Eq '(^/|(^|/)\.\.(/|$))' <<< "$listing"; then
+            echo 'Generated archive contains an unsafe path.' >&2
+            exit 1
+          fi
+
+          rm -rf extracted
+          mkdir extracted
+          tar -xzf "$archive" -C extracted --no-same-owner
+          if find extracted -type l -print -quit | grep -q .; then
+            echo 'Generated archive contains a symbolic link.' >&2
+            exit 1
+          fi
+          [[ -f extracted/src/main/java/org/drinkless/tdlib/Client.java ]]
+          [[ -f extracted/src/main/java/org/drinkless/tdlib/TdApi.java ]]
+          [[ -f extracted/src/main/libs/arm64-v8a/libtdjni.so ]]
+          [[ -f extracted/src/main/libs/armeabi-v7a/libtdjni.so ]]
+
+          rm -rf src/main/java src/main/libs
+          mkdir -p src/main
+          cp -a extracted/src/main/java src/main/java
+          cp -a extracted/src/main/libs src/main/libs
+
+      - name: Commit, tag, and push atomically
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+          VERSION: ${{ needs.build.outputs.version }}
+          UPSTREAM_SHA: ${{ needs.build.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A -- src/main/java src/main/libs
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo 'A new TDLib version produced no generated changes.' >&2
+            exit 1
+          fi
+
+          git commit \
+            -m "chore(libtd): update TDLib to $VERSION" \
+            -m "Upstream: https://github.com/tdlib/td/commit/$UPSTREAM_SHA"
+
+          git fetch origin "$TARGET_BRANCH" --tags
+          base=$(git rev-parse HEAD^)
+          remote=$(git rev-parse "origin/$TARGET_BRANCH")
+          if [[ "$base" != "$remote" ]]; then
+            echo 'The publisher branch moved during the build; rerun the workflow.' >&2
+            exit 1
+          fi
+          if git show-ref --verify --quiet "refs/tags/v$VERSION"; then
+            echo "Tag v$VERSION already exists." >&2
+            exit 1
+          fi
+
+          git tag -a "v$VERSION" -m "libtd v$VERSION"
+          gh auth setup-git
+          git push --atomic origin \
+            "HEAD:refs/heads/$TARGET_BRANCH" \
+            "refs/tags/v$VERSION:refs/tags/v$VERSION"
+
+  release:
+    needs: [build, publish]
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download size report
+        if: needs.build.outputs.should_build == 'true'
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: libtd-${{ needs.build.outputs.version }}
+          path: artifact
+
+      - name: Ensure GitHub release exists
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=v$VERSION
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists."
+            exit 0
+          fi
+
+          if [[ -f artifact/size-report.md ]]; then
+            notes_file=artifact/size-report.md
+          else
+            notes_file=release-notes.md
+            printf 'Automated libtd %s build.\n' "$VERSION" > "$notes_file"
+          fi
+
+          gh release create "$tag" \
+            --verify-tag \
+            --title "libtd v$VERSION" \
+            --notes-file "$notes_file"
